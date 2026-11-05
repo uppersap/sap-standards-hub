@@ -211,7 +211,22 @@ function auditUI5(dir, type) {
         const hasCloseDlg = content.includes('onCloseDlg');
 
         if (hasShowMessage) {
-            addCheck('Reusable API', 'BaseController implements showMessage()', 'PASS');
+            const hasMessageBox = content.includes('"sap/m/MessageBox"') || content.includes("'sap/m/MessageBox'");
+            if (hasMessageBox) {
+                addCheck('Reusable API', 'BaseController implements showMessage() with MessageBox dependency', 'PASS');
+            } else {
+                addCheck(
+                    'Senior UI5 Architecture',
+                    'BaseController implements showMessage() but lacks "sap/m/MessageBox" AMD import',
+                    'FAIL',
+                    'showMessage() invoca MessageBox pero no está importado en sap.ui.define. Provocará ReferenceError en runtime.',
+                    { file: baseControllerRel, line: 1 },
+                    {
+                        description: 'Importa "sap/m/MessageBox" en el array de sap.ui.define y como argumento MessageBox en la función callback:',
+                        snippet: `sap.ui.define([\n    "sap/ui/core/mvc/Controller",\n    "sap/m/MessageBox"\n], function (Controller, MessageBox) {`
+                    }
+                );
+            }
         } else {
             addCheck(
                 'Reusable API',
@@ -220,8 +235,18 @@ function auditUI5(dir, type) {
                 'Falta el método centralizado showMessage() para notificaciones estándar con Promesas',
                 { file: baseControllerRel, line: 30 },
                 {
-                    description: 'Agrega el método showMessage() en BaseController.js:',
-                    snippet: `showMessage: function (sType, sMessage, sDetail) {
+                    description: 'Agrega showMessage() e IMPORTA "sap/m/MessageBox" en sap.ui.define:',
+                    snippet: `// 1. Asegúrate de importar "sap/m/MessageBox" en la cabecera:
+sap.ui.define([
+    "sap/ui/core/mvc/Controller",
+    "sap/m/MessageBox", // <-- OBLIGATORIO
+    ...
+], function (Controller, MessageBox, ...) {
+    "use strict";
+    ...
+
+// 2. Agrega la función en el cuerpo del controlador:
+showMessage: function (sType, sMessage, sDetail) {
     if ([undefined, null, ""].includes(sMessage)) return;
     return new Promise((resolve) => {
         switch (sType) {
@@ -245,7 +270,22 @@ function auditUI5(dir, type) {
         }
 
         if (hasOpenDlg && hasCloseDlg) {
-            addCheck('Reusable API', 'BaseController implements onOpenDlg() & onCloseDlg()', 'PASS');
+            const hasFragment = content.includes('"sap/ui/core/Fragment"') || content.includes("'sap/ui/core/Fragment'");
+            if (hasFragment) {
+                addCheck('Reusable API', 'BaseController implements onOpenDlg() & onCloseDlg() with Fragment cache', 'PASS');
+            } else {
+                addCheck(
+                    'Senior UI5 Architecture',
+                    'BaseController implements onOpenDlg() but lacks "sap/ui/core/Fragment" AMD import',
+                    'FAIL',
+                    'onOpenDlg() invoca Fragment.load pero no está importado en sap.ui.define. Provocará ReferenceError en runtime.',
+                    { file: baseControllerRel, line: 1 },
+                    {
+                        description: 'Importa "sap/ui/core/Fragment" en el array de sap.ui.define y como argumento Fragment en la función callback:',
+                        snippet: `sap.ui.define([\n    "sap/ui/core/mvc/Controller",\n    "sap/ui/core/Fragment"\n], function (Controller, Fragment) {`
+                    }
+                );
+            }
         } else {
             addCheck(
                 'Reusable API',
@@ -328,7 +368,10 @@ function auditUI5(dir, type) {
     // 6. Stray syntax / Typo scan in XML files with line-level accuracy & Auto-Fix
     scanXmlFiles(webappDir);
 
-    // 7. Multi-language check
+    // 7. Senior UI5 AMD Dependency Analysis (Controllers & Utilities)
+    scanAmdDependencies(webappDir);
+
+    // 8. Multi-language check
     const i18nDir = path.join(webappDir, 'i18n');
     if (fs.existsSync(i18nDir)) {
         const langFiles = fs.readdirSync(i18nDir).filter(f => f.startsWith('i18n') && f.endsWith('.properties'));
@@ -511,6 +554,105 @@ function scanXmlFiles(dir) {
 }
 
 // -------------------------------------------------------------
+// Senior UI5 AMD Dependency Scanner
+// -------------------------------------------------------------
+function scanAmdDependencies(webappDir) {
+    const KNOWN_UI5_MODULES = [
+        { name: 'MessageBox', module: 'sap/m/MessageBox', usage: /\bMessageBox\.(error|success|warning|information|confirm|alert|show)\b/ },
+        { name: 'MessageToast', module: 'sap/m/MessageToast', usage: /\bMessageToast\.show\b/ },
+        { name: 'Fragment', module: 'sap/ui/core/Fragment', usage: /\bFragment\.(load|byId)\b/ },
+        { name: 'Filter', module: 'sap/ui/model/Filter', usage: /\bnew\s+Filter\b/ },
+        { name: 'FilterOperator', module: 'sap/ui/model/FilterOperator', usage: /\bFilterOperator\.[A-Z]+/ },
+        { name: 'JSONModel', module: 'sap/ui/model/json/JSONModel', usage: /\bnew\s+JSONModel\b/ },
+        { name: 'Sorter', module: 'sap/ui/model/Sorter', usage: /\bnew\s+Sorter\b/ },
+        { name: 'History', module: 'sap/ui/core/routing/History', usage: /\bHistory\.getInstance\b/ },
+        { name: 'BusyIndicator', module: 'sap/ui/core/BusyIndicator', usage: /\bBusyIndicator\.(show|hide)\b/ }
+    ];
+
+    let missingCount = 0;
+
+    function checkFile(fullPath) {
+        if (!fs.existsSync(fullPath)) return;
+        const content = fs.readFileSync(fullPath, 'utf8');
+        const relativeFile = path.relative(resolvedTarget, fullPath);
+
+        const defineMatch = content.match(/sap\.ui\.define\s*\(\s*\[([\s\S]*?)\]\s*,\s*function\s*\(([\s\S]*?)\)/);
+        if (!defineMatch) return;
+
+        const rawImports = defineMatch[1];
+        const rawParams = defineMatch[2];
+
+        const importedModules = (rawImports.match(/['"][^'"]+['"]/g) || []).map(m => m.replace(/['"]/g, '').trim());
+        const paramNames = rawParams.split(',').map(p => p.trim().replace(/\/\*.*?\*\//g, '')).filter(Boolean);
+
+        for (const item of KNOWN_UI5_MODULES) {
+            if (item.usage.test(content)) {
+                const hasModuleImport = importedModules.includes(item.module);
+                const hasParam = paramNames.includes(item.name);
+
+                if (!hasModuleImport || !hasParam) {
+                    missingCount++;
+                    const lines = content.split('\n');
+                    let usageLine = 1;
+                    for (let i = 0; i < lines.length; i++) {
+                        if (item.usage.test(lines[i])) {
+                            usageLine = i + 1;
+                            break;
+                        }
+                    }
+
+                    let reason = '';
+                    if (!hasModuleImport && !hasParam) {
+                        reason = `'${item.name}' se utiliza pero "${item.module}" no está importado en sap.ui.define([...]) ni en function(...)`;
+                    } else if (!hasModuleImport) {
+                        reason = `"${item.module}" falta en el array de dependencias de sap.ui.define([...])`;
+                    } else {
+                        reason = `'${item.name}' falta como parámetro en la función callback function(...) de sap.ui.define`;
+                    }
+
+                    addCheck(
+                        'Senior UI5 Dependencies',
+                        `Missing AMD dependency: '${item.name}' used in ${path.basename(fullPath)}`,
+                        'FAIL',
+                        `${reason}. Provocará 'ReferenceError: ${item.name} is not defined' en runtime.`,
+                        { file: relativeFile, line: usageLine },
+                        {
+                            description: `Importa "${item.module}" en la cabecera sap.ui.define y como parámetro '${item.name}' en function(...):`,
+                            snippet: `// Cabecera en ${relativeFile}:\nsap.ui.define([\n    ...\n    "${item.module}"\n], function (..., ${item.name}) {\n    "use strict";\n    ...`
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    const checkDirs = [
+        path.join(webappDir, 'controller'),
+        path.join(webappDir, 'utils')
+    ];
+
+    for (const d of checkDirs) {
+        if (fs.existsSync(d)) {
+            const files = fs.readdirSync(d);
+            for (const f of files) {
+                if (f.endsWith('.js')) {
+                    checkFile(path.join(d, f));
+                }
+            }
+        }
+    }
+
+    const compFile = path.join(webappDir, 'Component.js');
+    if (fs.existsSync(compFile)) {
+        checkFile(compFile);
+    }
+
+    if (missingCount === 0) {
+        addCheck('Senior UI5 Dependencies', 'All controllers and helpers declare valid AMD dependencies (no undeclared globals)', 'PASS');
+    }
+}
+
+// -------------------------------------------------------------
 // Print Report to Terminal
 // -------------------------------------------------------------
 console.log(`${colors.bright}AUDIT CHECKLIST BREAKDOWN:${colors.reset}\n`);
@@ -657,16 +799,20 @@ function consultLocalAI() {
 }
 
 function executePrompt(modelName, failedChecks, ollamaConfig = getOllamaConfig()) {
-    const prompt = `Eres un asistente de desarrollo SAP ultra conciso y directo al grano.
-Analiza estos problemas en el proyecto ${detectedType}:
+    const prompt = `Eres un Arquitecto Senior en SAP BTP Fiori, SAPUI5 y CAP con certificación y más de 10 años de experiencia técnica.
+
+REGLAS DE ORO DE ARQUITECTURA SAPUI5 SENIOR:
+1. GESTIÓN ESTRICTA DE AMD (sap.ui.define): En SAPUI5 jamás uses objetos o clases de la librería (como MessageBox, MessageToast, Fragment, Filter, FilterOperator, JSONModel, Sorter, BusyIndicator, etc.) directamente en métodos sin haberlos importado en el array de 'sap.ui.define([ ... ])' Y haberlos recibido como argumentos en 'function(...)'.
+2. PREVENCIÓN DE REFERENCEERROR: Si se usa una clase sin su importación AMD, el navegador arrojará 'ReferenceError: <Clase> is not defined' en runtime.
+3. PRECISIÓN QUIRÚRGICA: Siempre que propongas crear o modificar una función que use clases SAP, muestra tanto el código del método como la importación exacta requerida en la cabecera sap.ui.define.
+
+Analiza estos problemas detectados en el proyecto ${detectedType}:
 ${JSON.stringify(failedChecks.map(c => ({ issue: c.description, file: c.location?.file, line: c.location?.line, cause: c.details })), null, 2)}
 
-INSTRUCCIONES ESTRICTAS:
-- Sé directo y breve: máximo 2 a 3 líneas por problema.
-- NO des introducciones, NO inventes ejemplos hipotéticos, NO repitas conceptos.
-- Para cada problema indica únicamente:
-  1. Qué está mal (1 frase corta).
-  2. El código exacto de la solución para esa línea específica.`;
+INSTRUCCIONES DE RESPUESTA:
+- Responde de forma técnica, concisa y directa (máximo 4 a 5 líneas por problema).
+- Si falta una importación, muestra la cabecera sap.ui.define corregida y el método correspondiente.
+- NO des introducciones genéricas ni texto de relleno, habla como un Arquitecto Senior Fiori.`;
 
     const payload = JSON.stringify({
         model: modelName,
@@ -851,14 +997,16 @@ function askCustomInstruction(rl, modelName, failedChecks) {
 
         console.log(`\n${colors.dim}Consultando a ${modelName}...${colors.reset}`);
 
-        const prompt = `Contexto del proyecto SAP (${detectedType}):
+        const prompt = `Eres un Arquitecto Senior en SAP BTP Fiori, SAPUI5 y CAP.
+Contexto del proyecto (${detectedType}):
 Problemas detectados:
 ${JSON.stringify(failedChecks.map(c => ({ issue: c.description, file: c.location?.file, line: c.location?.line })), null, 2)}
 
 Instrucción del desarrollador:
 "${userPrompt.trim()}"
 
-Responde de forma muy concisa y directa, dando el código exacto necesario sin rodeos.`;
+REGLA OBLIGATORIA: Si sugieres código que utilice clases de SAPUI5 (como MessageBox, MessageToast, Fragment, Filter, etc.), incluye siempre la cabecera sap.ui.define con la dependencia importada para prevenir ReferenceError en runtime.
+Responde de forma técnica, concisa y directa.`;
 
         const payload = JSON.stringify({
             model: modelName,

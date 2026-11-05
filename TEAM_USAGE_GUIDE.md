@@ -96,3 +96,4 @@ Para que la IP nunca cambie aunque apagues y prendas la máquina:
 3. Selecciona la IP recién creada -> **Acciones** -> **Asociar dirección IP elástica**.
 4. En **Instancia**, elige tu máquina `uppersap-ai-auditor` y confirma.
 5. ¡Listo! A partir de ese momento tendrás una IP permanente para siempre.
+
