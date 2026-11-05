@@ -657,14 +657,25 @@ function consultLocalAI() {
 }
 
 function executePrompt(modelName, failedChecks, ollamaConfig = getOllamaConfig()) {
-    const prompt = `Actua como un Arquitecto Senior SAP. Analiza estos ${failedChecks.length} problemas encontrados en un proyecto ${detectedType}:
-${JSON.stringify(failedChecks.map(c => ({ category: c.category, issue: c.description, location: c.location, details: c.details })), null, 2)}
-Proporciona una breve explicación técnica y la solución exacta en código para corregirlos.`;
+    const prompt = `Eres un asistente de desarrollo SAP ultra conciso y directo al grano.
+Analiza estos problemas en el proyecto ${detectedType}:
+${JSON.stringify(failedChecks.map(c => ({ issue: c.description, file: c.location?.file, line: c.location?.line, cause: c.details })), null, 2)}
+
+INSTRUCCIONES ESTRICTAS:
+- Sé directo y breve: máximo 2 a 3 líneas por problema.
+- NO des introducciones, NO inventes ejemplos hipotéticos, NO repitas conceptos.
+- Para cada problema indica únicamente:
+  1. Qué está mal (1 frase corta).
+  2. El código exacto de la solución para esa línea específica.`;
 
     const payload = JSON.stringify({
         model: modelName,
         prompt: prompt,
-        stream: false
+        stream: false,
+        options: {
+            temperature: 0.1,    // Muy bajo para máxima precisión sin inventar
+            num_predict: 300     // Límite de tokens para evitar respuestas kilométricas
+        }
     });
 
     const headers = Object.assign({}, ollamaConfig.headers, {
@@ -831,6 +842,7 @@ function reviewFixesOneByOne(rl, failedChecks, index) {
 }
 
 function askCustomInstruction(rl, modelName, failedChecks) {
+    const ollamaConfig = getOllamaConfig();
     rl.question(`\n${colors.cyan}${colors.bright}Escribe tu instrucción o pregunta para la IA:${colors.reset}\n> `, (userPrompt) => {
         if (!userPrompt.trim()) {
             promptUserMenu(modelName, failedChecks);
@@ -843,26 +855,32 @@ function askCustomInstruction(rl, modelName, failedChecks) {
 Problemas detectados:
 ${JSON.stringify(failedChecks.map(c => ({ issue: c.description, file: c.location?.file, line: c.location?.line })), null, 2)}
 
-Instrucción específica del desarrollador:
+Instrucción del desarrollador:
 "${userPrompt.trim()}"
 
-Responde como Arquitecto Senior SAP dando la explicación y el código específico solicitado.`;
+Responde de forma muy concisa y directa, dando el código exacto necesario sin rodeos.`;
 
         const payload = JSON.stringify({
             model: modelName,
             prompt: prompt,
-            stream: false
+            stream: false,
+            options: {
+                temperature: 0.2,
+                num_predict: 400
+            }
         });
 
-        const req = http.request({
-            hostname: '127.0.0.1',
-            port: 11434,
+        const headers = Object.assign({}, ollamaConfig.headers, {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload)
+        });
+
+        const req = ollamaConfig.protocol.request({
+            hostname: ollamaConfig.hostname,
+            port: ollamaConfig.port,
             path: '/api/generate',
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(payload)
-            },
+            headers: headers,
             timeout: 90000
         }, (res) => {
             let body = '';
