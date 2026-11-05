@@ -582,8 +582,29 @@ if (useAI) {
     finishProcess();
 }
 
+function getOllamaConfig() {
+    const rawHost = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
+    try {
+        const parsed = new URL(rawHost.startsWith('http') ? rawHost : `http://${rawHost}`);
+        return {
+            protocol: parsed.protocol === 'https:' ? require('https') : require('http'),
+            hostname: parsed.hostname,
+            port: parsed.port || (parsed.protocol === 'https:' ? 443 : 11434),
+            headers: process.env.OLLAMA_API_KEY ? { 'Authorization': `Bearer ${process.env.OLLAMA_API_KEY}` } : {}
+        };
+    } catch (e) {
+        return {
+            protocol: require('http'),
+            hostname: '127.0.0.1',
+            port: 11434,
+            headers: {}
+        };
+    }
+}
+
 function consultLocalAI() {
-    console.log(`${colors.cyan}${colors.bright}🤖 Conectando con IA Local (Ollama)...${colors.reset}`);
+    const ollamaConfig = getOllamaConfig();
+    console.log(`${colors.cyan}${colors.bright}🤖 Conectando con servidor de IA (${ollamaConfig.hostname}:${ollamaConfig.port})...${colors.reset}`);
 
     const failedChecks = results.checks.filter(c => c.status !== 'PASS');
     if (failedChecks.length === 0) {
@@ -593,12 +614,13 @@ function consultLocalAI() {
     }
 
     // 1. Check available models from /api/tags
-    const tagsReq = http.request({
-        hostname: '127.0.0.1',
-        port: 11434,
+    const tagsReq = ollamaConfig.protocol.request({
+        hostname: ollamaConfig.hostname,
+        port: ollamaConfig.port,
         path: '/api/tags',
         method: 'GET',
-        timeout: 3000
+        headers: ollamaConfig.headers,
+        timeout: 4000
     }, (res) => {
         let body = '';
         res.on('data', chunk => body += chunk);
@@ -607,37 +629,34 @@ function consultLocalAI() {
                 const data = JSON.parse(body);
                 const models = data.models || [];
                 if (models.length === 0) {
-                    console.log(`${colors.yellow}ℹ️ Ollama está corriendo, pero no tienes ningún modelo descargado aún.${colors.reset}`);
-                    console.log(`${colors.bright}Para descargar el modelo recomendado (rápido, ~900MB), ejecuta:${colors.reset}`);
+                    console.log(`${colors.yellow}ℹ️ Servidor Ollama conectado, pero no tiene modelos descargados aún.${colors.reset}`);
+                    console.log(`${colors.bright}Para descargar el modelo recomendado, corre en el servidor:${colors.reset}`);
                     console.log(`  ${colors.green}ollama run qwen2.5-coder:1.5b${colors.reset}\n`);
-                    // Still show interactive menu for deterministic fixes
                     promptUserMenu(null, failedChecks);
                     return;
                 }
 
-                // Pick first available model or preferred coder model
                 const selectedModel = models.find(m => m.name.includes('code'))?.name || models[0].name;
-                console.log(`${colors.green}✔ Usando modelo local:${colors.reset} ${colors.bright}${selectedModel}${colors.reset}`);
+                console.log(`${colors.green}✔ Usando modelo:${colors.reset} ${colors.bright}${selectedModel}${colors.reset}`);
                 console.log(`${colors.dim}Generando diagnóstico arquitectónico... (espera unos segundos)${colors.reset}`);
 
-                executePrompt(selectedModel, failedChecks);
+                executePrompt(selectedModel, failedChecks, ollamaConfig);
             } catch (e) {
-                promptUserMenu(null, failedChecks);
+                executePrompt('qwen2.5-coder', failedChecks, ollamaConfig);
             }
         });
     });
 
     tagsReq.on('error', () => {
-        console.log(`${colors.yellow}ℹ️ Ollama no está corriendo en http://localhost:11434.${colors.reset}`);
-        console.log(`${colors.dim}Para activar el servicio: ejecuta 'brew services start ollama'.${colors.reset}\n`);
-        // Offer interactive menu with rule-based fixes
+        console.log(`${colors.yellow}ℹ️ No se pudo conectar al servidor de IA en ${ollamaConfig.hostname}:${ollamaConfig.port}.${colors.reset}`);
+        console.log(`${colors.dim}Para local: 'brew services start ollama' | Para AWS: define export OLLAMA_HOST="http://tu-servidor-aws:11434"${colors.reset}\n`);
         promptUserMenu(null, failedChecks);
     });
 
     tagsReq.end();
 }
 
-function executePrompt(modelName, failedChecks) {
+function executePrompt(modelName, failedChecks, ollamaConfig = getOllamaConfig()) {
     const prompt = `Actua como un Arquitecto Senior SAP. Analiza estos ${failedChecks.length} problemas encontrados en un proyecto ${detectedType}:
 ${JSON.stringify(failedChecks.map(c => ({ category: c.category, issue: c.description, location: c.location, details: c.details })), null, 2)}
 Proporciona una breve explicación técnica y la solución exacta en código para corregirlos.`;
@@ -648,15 +667,17 @@ Proporciona una breve explicación técnica y la solución exacta en código par
         stream: false
     });
 
-    const req = http.request({
-        hostname: '127.0.0.1',
-        port: 11434,
+    const headers = Object.assign({}, ollamaConfig.headers, {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+    });
+
+    const req = ollamaConfig.protocol.request({
+        hostname: ollamaConfig.hostname,
+        port: ollamaConfig.port,
         path: '/api/generate',
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(payload)
-        },
+        headers: headers,
         timeout: 90000 // 90s for LLM generation
     }, (res) => {
         let body = '';
@@ -664,18 +685,17 @@ Proporciona una breve explicación técnica y la solución exacta en código par
         res.on('end', () => {
             try {
                 const response = JSON.parse(body);
-                console.log(`\n${colors.green}${colors.bright}💡 Diagnóstico de la IA Local (${modelName}):${colors.reset}`);
+                console.log(`\n${colors.green}${colors.bright}💡 Diagnóstico de la IA (${modelName}):${colors.reset}`);
                 console.log(response.response);
             } catch (e) {
                 console.log(`${colors.yellow}No se pudo parsear respuesta de Ollama.${colors.reset}`);
             }
-            // Show interactive action menu after AI diagnosis
             promptUserMenu(modelName, failedChecks);
         });
     });
 
     req.on('error', (err) => {
-        console.log(`${colors.yellow}Error comunicando con Ollama: ${err.message}${colors.reset}`);
+        console.log(`${colors.yellow}Error comunicando con servidor de IA: ${err.message}${colors.reset}`);
         promptUserMenu(null, failedChecks);
     });
 
