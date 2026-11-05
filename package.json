@@ -4,7 +4,9 @@
   "description": "Corporate Architecture Standards, Versioned Specifications, and Auditor CLI for SAP UI5, CAP, and ABAP Cloud projects.",
   "main": "cli/bin/sap-audit.js",
   "bin": {
-    "sap-audit": "./cli/bin/sap-audit.js"
+    "sap-audit": "./cli/bin/sap-audit.js",
+    "audit": "./cli/bin/sap-audit.js",
+    "Audit": "./cli/bin/sap-audit.js"
   },
   "scripts": {
     "audit": "node cli/bin/sap-audit.js",
