@@ -222,6 +222,9 @@ function auditUI5(dir, type) {
                     'showMessage() invoca MessageBox pero no está importado en sap.ui.define. Provocará ReferenceError en runtime.',
                     { file: baseControllerRel, line: 1 },
                     {
+                        type: 'amd-import',
+                        module: 'sap/m/MessageBox',
+                        param: 'MessageBox',
                         description: 'Importa "sap/m/MessageBox" en el array de sap.ui.define y como argumento MessageBox en la función callback:',
                         snippet: `sap.ui.define([\n    "sap/ui/core/mvc/Controller",\n    "sap/m/MessageBox"\n], function (Controller, MessageBox) {`
                     }
@@ -235,6 +238,7 @@ function auditUI5(dir, type) {
                 'Falta el método centralizado showMessage() para notificaciones estándar con Promesas',
                 { file: baseControllerRel, line: 30 },
                 {
+                    type: 'basecontroller-showmessage',
                     description: 'Agrega showMessage() e IMPORTA "sap/m/MessageBox" en sap.ui.define:',
                     snippet: `// 1. Asegúrate de importar "sap/m/MessageBox" en la cabecera:
 sap.ui.define([
@@ -281,6 +285,9 @@ showMessage: function (sType, sMessage, sDetail) {
                     'onOpenDlg() invoca Fragment.load pero no está importado en sap.ui.define. Provocará ReferenceError en runtime.',
                     { file: baseControllerRel, line: 1 },
                     {
+                        type: 'amd-import',
+                        module: 'sap/ui/core/Fragment',
+                        param: 'Fragment',
                         description: 'Importa "sap/ui/core/Fragment" en el array de sap.ui.define y como argumento Fragment en la función callback:',
                         snippet: `sap.ui.define([\n    "sap/ui/core/mvc/Controller",\n    "sap/ui/core/Fragment"\n], function (Controller, Fragment) {`
                     }
@@ -294,7 +301,35 @@ showMessage: function (sType, sMessage, sDetail) {
                 'Faltan los métodos onOpenDlg() o onCloseDlg() para carga de fragmentos en caché',
                 { file: baseControllerRel, line: 45 },
                 {
-                    description: 'Implementa onOpenDlg y onCloseDlg en BaseController.js para evitar duplicidad de instancias de fragmentos.'
+                    type: 'basecontroller-dialogs',
+                    description: 'Implementa onOpenDlg y onCloseDlg en BaseController.js para evitar duplicidad de instancias de fragmentos.',
+                    snippet: `// Agrega onOpenDlg y onCloseDlg en BaseController.js:
+onOpenDlg: function (sFragmentName, fnAdicional) {
+    var that = this;
+    if (!that[sFragmentName]) {
+        var sAppId = that.getOwnerComponent().getManifestEntry("/sap.app/id") || "app";
+        that[sFragmentName] = Fragment.load({
+            id: that.getView().getId(),
+            name: sAppId + ".view.fragment.create." + sFragmentName,
+            controller: that
+        }).then(function (oDialog) {
+            that.getView().addDependent(oDialog);
+            return oDialog;
+        });
+    }
+    that[sFragmentName].then(function (oDialog) {
+        if (fnAdicional) fnAdicional();
+        oDialog.open();
+    });
+},
+
+onCloseDlg: function (sFragmentName) {
+    if (this[sFragmentName]) {
+        this[sFragmentName].then(function (oDialog) {
+            oDialog.close();
+        });
+    }
+},`
                 }
             );
         }
@@ -899,48 +934,255 @@ function promptUserMenu(modelName, failedChecks) {
     });
 }
 
-function applyAllFixes(failedChecks) {
-    console.log(`\n${colors.cyan}${colors.bright}⚙️  Aplicando reparaciones sugeridas...${colors.reset}`);
-    let appliedCount = 0;
+function applyFix(c) {
+    if (!c.fix) return { success: false, reason: 'No hay arreglo definido' };
 
-    failedChecks.forEach(c => {
-        if (c.location && c.location.file && c.fix) {
+    try {
+        // 1. XML Typo / Stray character
+        if (c.fix.type === 'xml-stray' || (c.category === 'Syntax Integrity' && c.location && c.location.file)) {
             const fullPath = path.resolve(resolvedTarget, c.location.file);
-            if (fs.existsSync(fullPath)) {
+            if (fs.existsSync(fullPath) && c.location.line) {
                 const content = fs.readFileSync(fullPath, 'utf8');
                 const lines = content.split('\n');
-
-                if (c.location.line) {
-                    const lineIdx = c.location.line - 1;
-                    const line = lines[lineIdx];
-                    // Stray trailing character fix
-                    if (c.category === 'Syntax Integrity' && line) {
-                        const cleaned = line.replace(/(<\/[a-zA-Z0-9:]+>)[a-zA-Z0-9]+(\s*)$/, '$1$2');
-                        if (cleaned !== line) {
-                            lines[lineIdx] = cleaned;
-                            fs.writeFileSync(fullPath, lines.join('\n'), 'utf8');
-                            console.log(`  ${colors.green}✔ [${c.location.file}:${c.location.line}] Caracter suelto corregido exitosamente.${colors.reset}`);
-                            appliedCount++;
-                        }
+                const lineIdx = c.location.line - 1;
+                const line = lines[lineIdx];
+                if (line) {
+                    const cleaned = line.replace(/(<\/[a-zA-Z0-9:]+>)[a-zA-Z0-9]+(\s*)$/, '$1$2');
+                    if (cleaned !== line) {
+                        lines[lineIdx] = cleaned;
+                        fs.writeFileSync(fullPath, lines.join('\n'), 'utf8');
+                        return { success: true, description: `[${c.location.file}:${c.location.line}] Caracter tipográfico suelto eliminado en etiqueta XML` };
                     }
                 }
             }
         }
+
+        // 2. AMD Import injection in sap.ui.define
+        if (c.fix.type === 'amd-import' && c.location && c.location.file && c.fix.module && c.fix.param) {
+            const fullPath = path.resolve(resolvedTarget, c.location.file);
+            if (fs.existsSync(fullPath)) {
+                let content = fs.readFileSync(fullPath, 'utf8');
+                const defineRegex = /sap\.ui\.define\s*\(\s*\[([\s\S]*?)\]\s*,\s*function\s*\(([\s\S]*?)\)/;
+                const match = content.match(defineRegex);
+                if (match) {
+                    let importsStr = match[1];
+                    let paramsStr = match[2];
+                    const targetMod = c.fix.module;
+                    const targetParam = c.fix.param;
+                    let changed = false;
+
+                    if (!importsStr.includes(`"${targetMod}"`) && !importsStr.includes(`'${targetMod}'`)) {
+                        const lastQuoteIdx = Math.max(importsStr.lastIndexOf('"'), importsStr.lastIndexOf("'"));
+                        if (lastQuoteIdx !== -1) {
+                            importsStr = importsStr.substring(0, lastQuoteIdx + 1) + `,\n    "${targetMod}"` + importsStr.substring(lastQuoteIdx + 1);
+                        } else {
+                            importsStr = `\n    "${targetMod}"\n`;
+                        }
+                        changed = true;
+                    }
+
+                    if (!paramsStr.includes(targetParam)) {
+                        const trimmed = paramsStr.trim();
+                        paramsStr = trimmed ? `${trimmed}, ${targetParam}` : targetParam;
+                        changed = true;
+                    }
+
+                    if (changed) {
+                        const newDefine = `sap.ui.define([${importsStr}], function (${paramsStr})`;
+                        content = content.replace(defineRegex, newDefine);
+                        fs.writeFileSync(fullPath, content, 'utf8');
+                        return { success: true, description: `[${c.location.file}] Inyectada dependencia AMD "${targetMod}" y argumento ${targetParam}` };
+                    }
+                }
+            }
+        }
+
+        // 3. BaseController showMessage injection
+        if (c.fix.type === 'basecontroller-showmessage' && c.location && c.location.file) {
+            const fullPath = path.resolve(resolvedTarget, c.location.file);
+            if (fs.existsSync(fullPath)) {
+                let content = fs.readFileSync(fullPath, 'utf8');
+                if (!content.includes('showMessage')) {
+                    // Ensure MessageBox is imported
+                    const defineRegex = /sap\.ui\.define\s*\(\s*\[([\s\S]*?)\]\s*,\s*function\s*\(([\s\S]*?)\)/;
+                    const match = content.match(defineRegex);
+                    if (match) {
+                        let importsStr = match[1];
+                        let paramsStr = match[2];
+                        if (!importsStr.includes('sap/m/MessageBox')) {
+                            const lastQuoteIdx = Math.max(importsStr.lastIndexOf('"'), importsStr.lastIndexOf("'"));
+                            importsStr = importsStr.substring(0, lastQuoteIdx + 1) + ',\n    "sap/m/MessageBox"' + importsStr.substring(lastQuoteIdx + 1);
+                        }
+                        if (!paramsStr.includes('MessageBox')) {
+                            paramsStr = paramsStr.trim() ? `${paramsStr.trim()}, MessageBox` : 'MessageBox';
+                        }
+                        content = content.replace(defineRegex, `sap.ui.define([${importsStr}], function (${paramsStr})`);
+                    }
+
+                    const showMessageMethod = `\n        showMessage: function (sType, sMessage, sDetail) {\n            if ([undefined, null, ""].includes(sMessage)) return;\n            return new Promise((resolve) => {\n                switch (sType) {\n                    case "Error":\n                        MessageBox.error(sMessage, { details: sDetail });\n                        break;\n                    case "Success":\n                        MessageBox.success(sMessage);\n                        break;\n                    case "Warning":\n                        MessageBox.warning(sMessage, { details: sDetail });\n                        break;\n                    default:\n                        MessageBox.alert(sMessage);\n                }\n                resolve();\n            });\n        },\n`;
+                    const lastBraceIdx = content.lastIndexOf('});');
+                    if (lastBraceIdx !== -1) {
+                        content = content.substring(0, lastBraceIdx) + showMessageMethod + content.substring(lastBraceIdx);
+                        fs.writeFileSync(fullPath, content, 'utf8');
+                        return { success: true, description: `[${c.location.file}] Inyectado método centralizado showMessage() con MessageBox` };
+                    }
+                }
+            }
+        }
+
+        // 4. BaseController dialog caching injection (onOpenDlg / onCloseDlg)
+        if (c.fix.type === 'basecontroller-dialogs' && c.location && c.location.file) {
+            const fullPath = path.resolve(resolvedTarget, c.location.file);
+            if (fs.existsSync(fullPath)) {
+                let content = fs.readFileSync(fullPath, 'utf8');
+                if (!content.includes('onOpenDlg')) {
+                    // Ensure Fragment is imported
+                    const defineRegex = /sap\.ui\.define\s*\(\s*\[([\s\S]*?)\]\s*,\s*function\s*\(([\s\S]*?)\)/;
+                    const match = content.match(defineRegex);
+                    if (match) {
+                        let importsStr = match[1];
+                        let paramsStr = match[2];
+                        if (!importsStr.includes('sap/ui/core/Fragment')) {
+                            const lastQuoteIdx = Math.max(importsStr.lastIndexOf('"'), importsStr.lastIndexOf("'"));
+                            importsStr = importsStr.substring(0, lastQuoteIdx + 1) + ',\n    "sap/ui/core/Fragment"' + importsStr.substring(lastQuoteIdx + 1);
+                        }
+                        if (!paramsStr.includes('Fragment')) {
+                            paramsStr = paramsStr.trim() ? `${paramsStr.trim()}, Fragment` : 'Fragment';
+                        }
+                        content = content.replace(defineRegex, `sap.ui.define([${importsStr}], function (${paramsStr})`);
+                    }
+
+                    const dialogMethods = `\n        onOpenDlg: function (sFragmentName, fnAdicional) {\n            var that = this;\n            if (!that[sFragmentName]) {\n                var sAppId = that.getOwnerComponent().getManifestEntry("/sap.app/id") || "app";\n                that[sFragmentName] = Fragment.load({\n                    id: that.getView().getId(),\n                    name: sAppId + ".view.fragment.create." + sFragmentName,\n                    controller: that\n                }).then(function (oDialog) {\n                    that.getView().addDependent(oDialog);\n                    return oDialog;\n                });\n            }\n            that[sFragmentName].then(function (oDialog) {\n                if (fnAdicional) fnAdicional();\n                oDialog.open();\n            });\n        },\n\n        onCloseDlg: function (sFragmentName) {\n            if (this[sFragmentName]) {\n                this[sFragmentName].then(function (oDialog) {\n                    oDialog.close();\n                });\n            }\n        },\n`;
+                    const lastBraceIdx = content.lastIndexOf('});');
+                    if (lastBraceIdx !== -1) {
+                        content = content.substring(0, lastBraceIdx) + dialogMethods + content.substring(lastBraceIdx);
+                        fs.writeFileSync(fullPath, content, 'utf8');
+                        return { success: true, description: `[${c.location.file}] Inyectados métodos onOpenDlg() y onCloseDlg() con Fragment cache` };
+                    }
+                }
+            }
+        }
+
+        // 5. Git Hygiene: .gitignore
+        if (c.fix.type === 'gitignore') {
+            const gitignorePath = path.resolve(resolvedTarget, '.gitignore');
+            let current = fs.existsSync(gitignorePath) ? fs.readFileSync(gitignorePath, 'utf8') : '';
+            if (!current.includes('gen/')) {
+                current += (current.endsWith('\n') ? '' : '\n') + 'gen/\nmta_archives/\nresources/\n';
+                fs.writeFileSync(gitignorePath, current, 'utf8');
+                return { success: true, description: `[.gitignore] Agregado gen/ y mta_archives/ a .gitignore` };
+            }
+        }
+
+        // 6. Uncomment authorization in CAP cat-service.js
+        if (c.fix.type === 'uncomment-auth' && c.location && c.location.file) {
+            const fullPath = path.resolve(resolvedTarget, c.location.file);
+            if (fs.existsSync(fullPath)) {
+                const content = fs.readFileSync(fullPath, 'utf8');
+                const lines = content.split('\n');
+                let modified = false;
+                lines.forEach((line, idx) => {
+                    const trimmed = line.trim();
+                    if (trimmed.startsWith('//') && trimmed.includes('.before(') && trimmed.includes('authorize(')) {
+                        lines[idx] = line.replace(/^\s*\/\/\s*/, '    ');
+                        modified = true;
+                    }
+                });
+                if (modified) {
+                    fs.writeFileSync(fullPath, lines.join('\n'), 'utf8');
+                    return { success: true, description: `[${c.location.file}] Descomentadas líneas de validación de roles de seguridad` };
+                }
+            }
+        }
+    } catch (err) {
+        return { success: false, reason: err.message };
+    }
+
+    return { success: false, reason: 'Requiere implementación manual' };
+}
+
+function writeMarkdownReport() {
+    const reportPath = path.join(resolvedTarget, 'AUDIT_REPORT.md');
+    let md = `# Project Architecture & Code Quality Audit Report\n\n`;
+    md += `> Generado automáticamente por **SAP Standards Auditor & Fixer (v1.1)**\n`;
+    md += `> Fecha: ${new Date().toISOString()}\n`;
+    md += `> Directorio: \`${resolvedTarget}\`\n`;
+    md += `> Tipo de Proyecto: **${detectedType.toUpperCase()}**\n\n`;
+
+    md += `## 1. Quality Score & Resumen\n\n`;
+    md += `### Score: **${finalScore} / 100**\n\n`;
+    md += `* **PASS:** ${results.summary.pass}\n`;
+    md += `* **WARNING:** ${results.summary.warn}\n`;
+    md += `* **FAIL:** ${results.summary.fail}\n\n`;
+
+    md += `## 2. Detalle de Validaciones y Código de Solución\n\n`;
+
+    results.checks.forEach((c, idx) => {
+        const badge = c.status === 'PASS' ? '✅ PASS' : c.status === 'WARN' ? '⚠️ WARN' : '❌ FAIL';
+        const loc = c.location ? `\`${c.location.file}${c.location.line ? `:${c.location.line}` : ''}\`` : 'General';
+
+        md += `### ${idx + 1}. [${c.category}] ${c.description} - ${badge}\n\n`;
+        md += `* **Ubicación:** ${loc}\n`;
+        if (c.details) md += `* **Causa:** ${c.details}\n`;
+
+        if (c.fix) {
+            md += `* **Guía de Solución:** ${c.fix.description || ''}\n\n`;
+            if (c.fix.diff) {
+                md += `\`\`\`diff\n${c.fix.diff}\n\`\`\`\n\n`;
+            } else if (c.fix.snippet) {
+                md += `\`\`\`javascript\n${c.fix.snippet}\n\`\`\`\n\n`;
+            }
+        }
+        md += `---\n\n`;
+    });
+
+    try {
+        fs.writeFileSync(reportPath, md, 'utf8');
+        return reportPath;
+    } catch (e) {
+        return null;
+    }
+}
+
+function applyAllFixes(failedChecks) {
+    console.log(`\n${colors.cyan}${colors.bright}⚙️  Aplicando reparaciones sugeridas...${colors.reset}`);
+    let appliedCount = 0;
+    const manualChecks = [];
+
+    failedChecks.forEach(c => {
+        const res = applyFix(c);
+        if (res.success) {
+            console.log(`  ${colors.green}✔ ${res.description}${colors.reset}`);
+            appliedCount++;
+        } else {
+            manualChecks.push(c);
+        }
     });
 
     if (appliedCount > 0) {
-        console.log(`\n${colors.green}${colors.bright}✔ Se aplicaron ${appliedCount} mejoras automáticamente.${colors.reset}`);
-        console.log(`${colors.dim}Ejecuta de nuevo el auditor para verificar tu 100/100.${colors.reset}\n`);
-    } else {
-        console.log(`${colors.yellow}No se encontraron correcciones automáticas directas. Revisa las sugerencias manuales en AUDIT_REPORT.md.${colors.reset}\n`);
+        console.log(`\n${colors.green}${colors.bright}✔ Se aplicaron ${appliedCount} mejoras automáticamente en los archivos.${colors.reset}`);
     }
 
+    if (manualChecks.length > 0) {
+        console.log(`\n${colors.yellow}${colors.bright}📋 Mejoras que requieren desarrollo manual (código disponible):${colors.reset}`);
+        manualChecks.forEach(mc => {
+            const loc = mc.location?.file ? ` [${mc.location.file}]` : '';
+            console.log(`  ${colors.yellow}•${colors.reset}${loc} ${mc.description}`);
+            if (mc.fix && mc.fix.description) {
+                console.log(`    ${colors.dim}↳ ${mc.fix.description}${colors.reset}`);
+            }
+        });
+    }
+
+    writeMarkdownReport();
+    console.log(`\n${colors.cyan}📄 Informe con todo el código exportado a:${colors.reset} AUDIT_REPORT.md\n`);
     finishProcess();
 }
 
 function reviewFixesOneByOne(rl, failedChecks, index) {
     if (index >= failedChecks.length) {
         console.log(`\n${colors.green}✔ Revisión paso a paso completada.${colors.reset}\n`);
+        writeMarkdownReport();
         rl.close();
         finishProcess();
         return;
@@ -952,6 +1194,8 @@ function reviewFixesOneByOne(rl, failedChecks, index) {
     if (item.location) console.log(`${colors.dim}Ubicación: ${item.location.file}${item.location.line ? `:${item.location.line}` : ''}${colors.reset}`);
     if (item.fix && item.fix.diff) {
         console.log(`${colors.cyan}Cambio propuesto:${colors.reset}\n${item.fix.diff}`);
+    } else if (item.fix && item.fix.snippet) {
+        console.log(`${colors.cyan}Código propuesto:${colors.reset}\n${item.fix.snippet}`);
     } else if (item.fix && item.fix.description) {
         console.log(`${colors.cyan}Sugerencia:${colors.reset} ${item.fix.description}`);
     }
@@ -959,25 +1203,18 @@ function reviewFixesOneByOne(rl, failedChecks, index) {
     rl.question(`\n¿Deseas aplicar esta mejora? (y/n/s para salir): `, (ans) => {
         const a = ans.trim().toLowerCase();
         if (a === 's') {
+            writeMarkdownReport();
             rl.close();
             finishProcess();
             return;
         }
 
         if (a === 'y' || a === 'si' || a === 'yes') {
-            if (item.location && item.location.file && item.location.line) {
-                const fullPath = path.resolve(resolvedTarget, item.location.file);
-                if (fs.existsSync(fullPath)) {
-                    const content = fs.readFileSync(fullPath, 'utf8');
-                    const lines = content.split('\n');
-                    const lineIdx = item.location.line - 1;
-                    const line = lines[lineIdx];
-                    if (item.category === 'Syntax Integrity' && line) {
-                        lines[lineIdx] = line.replace(/(<\/[a-zA-Z0-9:]+>)[a-zA-Z0-9]+(\s*)$/, '$1$2');
-                        fs.writeFileSync(fullPath, lines.join('\n'), 'utf8');
-                        console.log(`${colors.green}✔ Cambio aplicado en ${item.location.file}:${item.location.line}${colors.reset}`);
-                    }
-                }
+            const res = applyFix(item);
+            if (res.success) {
+                console.log(`  ${colors.green}✔ ${res.description}${colors.reset}`);
+            } else {
+                console.log(`  ${colors.yellow}ℹ️ Este punto requiere copiar el código manualmente en tu archivo (detallado en AUDIT_REPORT.md).${colors.reset}`);
             }
         } else {
             console.log(`${colors.dim}Saltando este cambio.${colors.reset}`);
@@ -1061,42 +1298,8 @@ Responde de forma técnica, concisa y directa.`;
 // -------------------------------------------------------------
 function finishProcess() {
     if (generateReport) {
-        const reportPath = path.join(resolvedTarget, 'AUDIT_REPORT.md');
-        let md = `# Project Architecture & Code Quality Audit Report\n\n`;
-        md += `> Generated automatically by **SAP Standards Auditor v1.1.0**\n`;
-        md += `> Date: ${new Date().toISOString()}\n`;
-        md += `> Target: \`${resolvedTarget}\`\n`;
-        md += `> Standard: **${detectedType.toUpperCase()}**\n\n`;
-
-        md += `## 1. Quality Score & Health\n\n`;
-        md += `### Score: **${finalScore} / 100**\n\n`;
-        md += `* **PASS:** ${results.summary.pass}\n`;
-        md += `* **WARNING:** ${results.summary.warn}\n`;
-        md += `* **FAIL:** ${results.summary.fail}\n\n`;
-
-        md += `## 2. Issues Breakdown & Exact Fixes\n\n`;
-
-        results.checks.forEach((c, idx) => {
-            const badge = c.status === 'PASS' ? '✅ PASS' : c.status === 'WARN' ? '⚠️ WARN' : '❌ FAIL';
-            const loc = c.location ? `\`${c.location.file}${c.location.line ? `:${c.location.line}` : ''}\`` : 'General';
-
-            md += `### ${idx + 1}. [${c.category}] ${c.description} - ${badge}\n\n`;
-            md += `* **Location:** ${loc}\n`;
-            if (c.details) md += `* **Cause:** ${c.details}\n`;
-
-            if (c.fix) {
-                md += `* **Fix Guide:** ${c.fix.description || ''}\n\n`;
-                if (c.fix.diff) {
-                    md += `\`\`\`diff\n${c.fix.diff}\n\`\`\`\n\n`;
-                } else if (c.fix.snippet) {
-                    md += `\`\`\`javascript\n${c.fix.snippet}\n\`\`\`\n\n`;
-                }
-            }
-            md += `---\n\n`;
-        });
-
-        fs.writeFileSync(reportPath, md, 'utf8');
-        console.log(`${colors.green}📄 Markdown report with diffs & fixes exported to:${colors.reset} ${reportPath}\n`);
+        writeMarkdownReport();
+        console.log(`${colors.green}📄 Markdown report with diffs & fixes exported to:${colors.reset} ${path.join(resolvedTarget, 'AUDIT_REPORT.md')}\n`);
     }
 
     if (strictMode && (results.summary.fail > 0 || results.summary.warn > 0)) {
